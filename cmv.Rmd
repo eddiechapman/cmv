@@ -1,0 +1,253 @@
+---
+title: "COSC5610 CMV Analysis"
+author: "Noah Asaria, David Reddy, Eddie Chapman"
+output:
+  pdf_document: default
+  html_notebook: default
+  html_document:
+    df_print: paged
+---
+
+```{r echo = FALSE}
+knitr::opts_chunk$set(
+  message = FALSE,
+  warning = FALSE
+)
+```
+
+
+```{r}
+library(jsonlite)
+library(lubridate)
+library(SnowballC)
+library(tidyverse)
+library(topicmodels)
+library(tm)
+library(tidytext)
+```
+
+
+## Data import
+
+Data is separated into two spreadsheets:
+
+- `threads.csv`
+- `comments.csv`
+
+### Thread data
+
+After importing, any threads that do not start with `CMV:` are dropped. These are moderator notes or other irrelevant threads. 
+
+We remove `CMV:` from the remaining thread titles. We also remove the default moderator note that is included at the bottom of most thread texts. 
+
+```{r}
+threads <- read_csv("threads.csv", col_names = TRUE) %>%
+  filter(str_starts(title, coll("CMV:"))) %>%
+  mutate(title = str_replace(title, "CMV:", ""),
+         text = str_replace(text, "\\*Hello, users of CMV\\! .* \\*Happy CMVing\\!\\*", ""),
+         id = as.factor(id),
+         timestamp = as.Date.POSIXct(timestamp),
+         week = week(timestamp),
+         year = year(timestamp),
+         ups = as.integer(ups),
+         downs = as.integer(downs))
+```
+
+### Comment data
+
+Comment data contains the author, OP, thread, and timestamp of all threads.
+
+We drop any comments that are posted by the thread's OP, by the DeltaBot, or by a deleted account. 
+
+We also drop any comments correponding to irrelevant threads identified in the `threads` dataframe.
+
+```{r}
+comments <- read_csv('comments.csv', col_names = TRUE) %>%
+  filter(author != op,
+         author != 'DeltaBot',
+         author != '[DELETED]') %>%
+  mutate(id = as.factor(id),
+         thread = as.factor(thread),
+         timestamp = as.Date.POSIXct(timestamp)) %>%
+  semi_join(threads, by = c("thread" = "id")) 
+
+```
+
+## Summary statistics
+
+Here we identify the total number of comments and unique commentors for each thread.
+
+```{r}
+users_per_thread <- comments %>%
+  select(thread, author) %>%
+  distinct() %>%
+  group_by(thread) %>%
+  count(name = 'n_users')
+
+comments_per_thread <- comments %>%
+  select(thread, id) %>%
+  distinct() %>%
+  group_by(thread) %>%
+  count(name = 'n_comments')
+
+threads <- threads %>%
+  left_join(users_per_thread, by = c("id" = "thread")) %>%
+  left_join(comments_per_thread, by = c("id" = "thread")) %>%
+  mutate(comments_per_user = n_users / n_comments)
+
+```
+
+
+
+## Sampling
+
+(Temporary) we reduce the dataset to improve computation time.
+
+Threads are selected which fall between the median and 3rd quartile measure of number of unique users, number of total comments, and upvotes. 
+
+This leaves us with 505 threads.
+
+```{r}
+popular_threads <- threads %>%
+  filter(n_users >= 17, n_users <= 29) %>%
+  filter(n_comments >= 32, n_comments <= 60) %>%
+  filter(ups >= 10, ups <= 30)
+```
+
+Threads are grouped into weeks and the average number of threads per week is calculated.
+
+Any weeks featuring a thread count between the mean thread count and 3rd quartile thread count are retained.
+
+This leaves us with 303 threads.
+
+```{r}
+threads_per_week <- popular_threads %>%
+  group_by(year, week) %>%
+  count(name = "threads_per_week") %>%
+  arrange(year, week) 
+
+popular_threads <- popular_threads %>%
+  left_join(threads_per_week)
+
+sample <- popular_threads %>%
+  filter(threads_per_week >= 5, threads_per_week <= 10)
+
+summary(sample)
+```
+
+## Tokenizing
+
+Our text cleaning function removes URLs, symbols and formatting, and a few common reddit terms.
+
+```{r}
+clean_text <- function(text) {
+  str_replace_all(
+    text, 
+    c("https?:\\/\\/.*[\r\n]*" = " ",                       # URLs
+      "_____|\\\n|&amp;|#x200B;|nbsp|&gt;" = " ",           # Symbols and formatting
+      "'s" = " ")  
+  )
+}
+```
+
+The following terms are removed due to their common usage in the r/ChangeMyView corpus.
+
+```{r}
+my_stop_words <- c(
+  "edit", "reddit", "cmv", "change", "view", "people", "person", "post", 
+  "vote", "delta", "score", "comment", "debate", "life", "feel", "time"
+)
+```
+
+First, the text component of the threads is created by joining the thread title with the thread body text. This is what will be analyzed during topic modelling.
+
+The thread text is tokenized into individual words. Non-alphabetic words are removed, as are any matches between the thread words and the two stop word lists. Words shorter than 3 characters are also dropped.
+
+```{r}
+tokens <- sample %>%
+  mutate(text = paste(title, text)) %>%
+  mutate(text = clean_text(text)) %>%
+  select(id, text) %>%
+  unnest_tokens(word, text) %>%
+  filter(str_detect(word, "[a-z]$")) %>%
+  filter(!word %in% my_stop_words) %>%
+  filter(!word %in% stop_words$word) %>%
+  filter(length(word) > 2)
+```
+
+The remaining words are saved in a vector to be used as a dictionary during stem completion.
+
+```{r}
+dictionary <- tokens %>%
+  select(word) %>%
+  unique() %>%
+  arrange(word)
+
+dictionary <- as.vector(dictionary$word)
+```
+
+Stemming is performed on the thread words. The stems are completed using the dictionary vector so that they are standardized and readable. Lost terms are dropped. The term frequencies are tallied for conversion to a document term matrix.
+
+```{r}
+tokens <- tokens %>%
+  mutate(word = wordStem(word, language = "english")) %>%
+  mutate(word = stemCompletion(word, dictionary = dictionary)) %>%
+  select(id, word) %>%
+  filter(word != "") %>%
+  count(id, word, sort = TRUE) %>%
+  ungroup()
+
+tokens
+```
+
+## Modelling
+
+The thread words are coverted to a document term matrix, and passed to the LDA function. 
+
+You can play with the `k =` argument to `LDA()` to pick different numbers of topics. 16 seems to be reasonable.
+
+```{r}
+cmv_dtm <- tokens %>%
+  cast_dtm(id, word, n)
+
+cmv_lda <- cmv_dtm %>%
+  LDA(k = 25)
+```
+
+Topics are visualized by their most frequently occuring words.
+
+```{r}
+cmv_topics <- tidy(cmv_lda, matrix = "beta")
+
+top_terms <- cmv_topics %>%
+  group_by(topic) %>%
+  top_n(5, beta) %>%
+  ungroup() %>%
+  arrange(topic, -beta)
+
+top_terms
+
+top_terms %>%
+  mutate(term = reorder_within(term, beta, topic)) %>%
+  ggplot(aes(term, beta, fill = factor(topic))) +
+  geom_col(show.legend = FALSE) +
+  facet_wrap(~ topic, scales = "free") +
+  coord_flip() +
+  scale_x_reordered()
+```
+
+The titles of the most representative threads for each topic are displayed for inspection. 
+
+```{r}
+thread_topics <- tidy(cmv_lda, matrix = "gamma")
+
+topic_threads <- thread_topics %>%
+  group_by(topic) %>%
+  arrange(topic, desc(gamma)) %>%
+  top_n(3, gamma) %>%
+  ungroup() %>%
+  left_join(sample, by = c("document" = "id")) %>%
+  select(topic, title)
+
+topic_threads  
+```
